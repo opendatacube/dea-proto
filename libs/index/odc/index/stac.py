@@ -1,6 +1,7 @@
 import math
+import re
 from pathlib import Path
-from typing import Dict, Tuple, Any, Optional
+from typing import Dict, Tuple, Any, Optional, Iterable
 from uuid import UUID
 
 from datacube.utils.geometry import Geometry
@@ -32,11 +33,11 @@ MAPPING_STAC_TO_EO3 = {
 }
 
 
-def _stac_product_lookup(item: Document) -> Tuple[str, str, Optional[str], str]:
+def _stac_product_lookup(item: Document) -> Tuple[Optional[str], str, Optional[str], str]:
     properties = item['properties']
 
-    product_label = item['id']
-    product_name = properties['platform']
+    product_label = None
+    product_name = properties.pop('odc:product', None) or properties['platform']
     region_code = None
     default_grid = None
 
@@ -56,9 +57,14 @@ def _stac_product_lookup(item: Document) -> Tuple[str, str, Optional[str], str]:
     elif properties.get('platform') in LANDSAT_PLATFORMS:
         self_href = _find_self_href(item)
         product_label = Path(self_href).stem.replace(".stac-item", "")
-        product_name = properties.get('odc:product')
         region_code = properties.get('odc:region_code')
         default_grid = "g30m"
+
+    # On many stac documents the 'id' is a usable label.
+    # (But we don't want to use it if it's only an unreadable uuid)
+    if not product_label:
+        if not _looks_like_an_id(item['id']):
+            product_label = item['id']
 
     return product_label, product_name, region_code, default_grid
 
@@ -147,9 +153,40 @@ def _convert_value_to_eo3_type(key: str, value):
 
     """
     if key == "instruments":
-        return value[0] if len(value) > 0 else None
-    else:
-        return value
+        return _stac_to_eo3_instruments(value)
+    if key == 'platform':
+        return _normalise_platform(value)
+
+    return value
+
+
+def _normalise_platform(s: str) -> str:
+    """
+    EO3's eo:platform field is formatted according to stac examples circa version 0.6.
+
+    Stac doccuments on the web use a few different cases and separators, but ODC's matching
+    is case-sensitive and exact, so we want need to be consisent.
+
+    >>> _normalise_platform('LANDSAT_8')
+    'landsat-8'
+    """
+    return s.lower().replace("_", "-")
+
+
+def _stac_to_eo3_instruments(value: Iterable[str]) -> str:
+    """
+    EO3's eo:instrument field follows the stac examples circa stac version 0.6.
+
+    For landsat, this matches the exact instrument formatting in USGS's MTL files.
+
+    >>> _stac_to_eo3_instruments(['tm'])
+    'TM'
+    >>> _stac_to_eo3_instruments(['oli'])
+    'OLI'
+    >>> _stac_to_eo3_instruments(['tirs', 'oli'])
+    'OLI_TIRS'
+    """
+    return '_'.join(sorted(v.strip().upper() for v in value))
 
 
 def _get_stac_properties_lineage(input_stac: Document) -> Tuple[Document, Any]:
@@ -160,7 +197,12 @@ def _get_stac_properties_lineage(input_stac: Document) -> Tuple[Document, Any]:
     prop = {MAPPING_STAC_TO_EO3.get(key, key): _convert_value_to_eo3_type(key, val)
             for key, val in properties.items()}
     if prop.get('odc:processing_datetime') is None:
-        prop['odc:processing_datetime'] = properties['datetime'].replace("000+00:00", "Z")
+        prop['odc:processing_datetime'] = (
+            # Stac's 'created' property.
+            prop.pop('created', None) or
+            # TODO: This is not ideal. Perhaps the file ctime?
+            properties['datetime'].replace("000+00:00", "Z")
+        )
     if prop.get('odc:file_format') is None:
         prop['odc:file_format'] = 'GeoTIFF'
 
@@ -194,10 +236,12 @@ def stac_transform(input_stac: Document, relative: bool = True) -> Document:
     if _check_valid_uuid(input_stac["id"]):
         deterministic_uuid = input_stac["id"]
     else:
+        stable_identifier = product_label or input_stac['id']
+
         if product_name in ["s2_l2a"]:
-            deterministic_uuid = str(odc_uuid("sentinel-2_stac_process", "1.0.0", [product_label]))
+            deterministic_uuid = str(odc_uuid("sentinel-2_stac_process", "1.0.0", [stable_identifier]))
         else:
-            deterministic_uuid = str(odc_uuid(f"{product_name}_stac_process", "1.0.0", [product_label]))
+            deterministic_uuid = str(odc_uuid(f"{product_name}_stac_process", "1.0.0", [stable_identifier]))
 
     bands, grids = _get_stac_bands(input_stac, default_grid, relative=relative)
 
@@ -209,15 +253,22 @@ def stac_transform(input_stac: Document, relative: bool = True) -> Document:
 
     geometry = _geographic_to_projected(input_stac['geometry'], native_crs)
 
+    product_label = product_label or input_stac.pop('title', None)
+
+    optional_properties = {}
+    if product_label:
+        optional_properties['label'] = product_label
+
     stac_odc = {
         '$schema': 'https://schemas.opendatacube.org/dataset',
         'id': deterministic_uuid,
+        **optional_properties,
+
         'crs': native_crs,
         'grids': grids,
         'product': {
             'name': product_name.lower()
         },
-        'label': product_label,
         'properties': stac_properties,
         'measurements': bands,
         'lineage': {}
@@ -233,3 +284,31 @@ def stac_transform(input_stac: Document, relative: bool = True) -> Document:
         stac_odc['lineage'] = lineage
 
     return stac_odc
+
+
+def _looks_like_an_id(s: str) -> bool:
+    """
+    Is this purely numeric or a uuid?
+
+    >>> _looks_like_an_id('123')
+    True
+    >>> _looks_like_an_id('23d8a399-137d-45b3-9ba1-fd610bca2a13')
+    True
+    >>> _looks_like_an_id('DA6E7559-8957-482C-B389-4A90263655D0')
+    True
+    >>> _looks_like_an_id('ga_ls5t_ard_3-1-20200605_113081_1988-03-30_final')
+    False
+    >>> _looks_like_an_id('LT05_L1TP_113081_19880330_20170209_01_T1')
+    False
+    >>> _looks_like_an_id('beef-feed-34')
+    False
+    """
+    # Numeric?
+    if re.fullmatch(r'[0-9]+', s) is not None:
+        return True
+
+    # UUID?
+    if re.fullmatch(r'[0-9A-Fa-f-]+(-[0-9A-Fa-f]+){4}', s) is not None:
+        return True
+
+    return False
