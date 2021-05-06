@@ -23,6 +23,7 @@ setup(
         "datacube",
         "scikit-image",
         "dask_image",
+        "networkx",
     ],
     extras_require={'hdstats': ["hdstats>=0.1.7.post5"]},
     packages=["odc.algo"],

@@ -9,6 +9,7 @@ from bisect import bisect_right, bisect_left
 import numpy as np
 import xarray as xr
 import dask
+from dask.core import get_dependencies, ishashable, istask
 from dask.distributed import wait as dask_wait, TimeoutError
 import dask.array as da
 from dask.highlevelgraph import HighLevelGraph
@@ -16,6 +17,7 @@ from dask import is_dask_collection
 import functools
 import toolz
 from toolz import partition_all
+import networkx as nx
 from ._tools import ROI, roi_shape, slice_in_out
 
 
@@ -610,3 +612,86 @@ def wait_for_future(
         t_now = datetime.utcnow()
 
         yield ((t_now - t0).total_seconds(), t_now)
+
+
+def to_nx_graph(dsk):
+    """
+    Converts a dask graph to a networkx graph. This code is adapted from dask.dot.to_graphviz
+    """
+
+    edges = []
+
+    for k, v in dsk.items():
+        if istask(v):
+            for dep in get_dependencies(dsk, k):
+                edges.append((dep, k))
+
+        elif ishashable(v) and v in dsk:
+            v_name = v
+            edges.append((v, k))
+
+    return nx.DiGraph(edges)
+
+
+def _get_terminal_nodes(nx_graph, leaf=True):
+    if leaf:
+        return [node for node in nx_graph.nodes() if len(list(nx_graph.successors(node))) == 0]
+    else:
+        return [node for node in nx_graph.nodes() if len(list(nx_graph.predecessors(node))) == 0]
+
+
+def parition_graph(nx_graph):
+    """
+    Partitions the input graph into smaller subgraphs and returns the leaf nodes of the subgraphs.
+
+    This assumes a single output node. It removes nodes that are common ancenstors of to create
+    a disconnected graph of multiple connected components. The leaf nodes of each connected 
+    component is returned.
+
+           o
+        __/ \__
+       /       \
+      g         h     ======>      g         h     =====> returns nodes g and h
+    / | \     / | \              / | \     / | \
+    | | | ... | | |              | | | ... | | |
+    a b c     d e f              a b c     d e f
+    
+    """
+    root_nodes = _get_terminal_nodes(nx_graph, leaf=False)
+    common_descendants = nx.algorithms.dag.descendants(digraph, root_nodes[0])
+    for node in root_nodes:
+        common_descendants = common_descendants.intersection(nx.algorithms.dag.descendants(digraph, node))
+
+    disconnected_graph = digraph.copy()
+    disconnected_graph.remove_nodes_from(common_descendants)
+
+    components = nx.weakly_connected_components(disconnected_graph)
+    components = (_get_terminal_nodes(disconnected_graph.subgraph(component), leaf=True) for component in components)
+    
+    return components
+
+
+def auto_persist(dsk, n_concurrent):
+    """
+    Persists automatically determined dask nodes to minimize peak memory usage.
+    """
+
+    nx_graph = to_nx_graph(dsk)
+    components = parition_graph(nx_graph)
+
+    for chunk in partition_all(n_concurrent, components):
+        chunk = [
+            Delayed(key, dsk)
+            for component in chunk
+            for key in component
+        ]
+    
+        chunk = client.persist(chunk)
+        _ = dask_wait(chunk)
+
+    # assumes only one output node
+    leaf = _get_terminal_nodes(nx_graph, leaf=True)[0]
+    
+    # this needs to be computed instead of the original output array 
+    out = Delayed(leaf, dsk)
+    return out
